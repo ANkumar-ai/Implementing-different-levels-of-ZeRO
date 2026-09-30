@@ -1,23 +1,25 @@
 # ERA V5 · Session 12 — ZeRO 1/2/3 on 32 Virtual GPUs
 
-Notebook: [`zero_stages_32_virtual_gpus.ipynb`](zero_stages_32_virtual_gpus.ipynb) — open in Colab, Run all. Needs only `torch` + `matplotlib`. Uses the Colab GPU if enabled, else CPU.
+Notebook: [`zero_stages_32_virtual_gpus.ipynb`](zero_stages_32_virtual_gpus.ipynb) — open in Colab, Run all. Needs only `torch`, `matplotlib`, `datasets` (Colab defaults). Uses the Colab GPU if enabled, else CPU.
 
 ## What I built
 1. 32 virtual GPUs (ranks 0–31), simulated in one process.
 2. Collectives (`reduce_scatter`, `all_gather`) written by hand, so every byte a rank sends is counted.
 3. All-reduce is built as reduce-scatter + all-gather, to show the two are the same thing.
-4. Toy model: 8 linear layers, width 256, ~526K params. Each layer is one bucket / one FSDP unit.
+4. Toy model: 8 linear layers of 256×256, ~526K params, trained on TinyStories as a byte-level next-byte predictor (one-hot byte in, 256 logits out). Each layer is one bucket / one FSDP unit.
 5. Real mixed-precision state per weight: bf16 weight (2 B) + bf16 grad (2 B) + fp32 master (4 B) + Adam m, v (8 B) = 16 B.
 6. Same data, same init → DP, ZeRO-1, ZeRO-2, ZeRO-3.
 
 ## Results (N = 32, 526,336 params, P = 1.05 MB)
 
+Run on a Colab GPU (`device=cuda`), TinyStories data.
+
 | stage | theory B/param | measured peak B/param | comm / step | fwd+bwd s | optimizer / rank |
 |---|---|---|---|---|---|
-| DP | 16.000 | 16.000 | 1.938P | 0.678 | 2.772 ms |
-| ZeRO-1 | 4.375 | 4.375 | 1.938P | 0.187 | 0.634 ms |
-| ZeRO-2 | 2.438 | 2.680 | 1.938P | 0.255 | 0.899 ms |
-| ZeRO-3 | 0.500 | 0.992 | 2.906P | 0.282 | 0.999 ms |
+| DP | 16.000 | 16.000 | 1.938P | 0.505 | 1.344 ms |
+| ZeRO-1 | 4.375 | 4.375 | 1.938P | 0.228 | 1.165 ms |
+| ZeRO-2 | 2.438 | 2.680 | 1.938P | 0.233 | 1.351 ms |
+| ZeRO-3 | 0.500 | 0.992 | 2.906P | 0.231 | 1.056 ms |
 
 1. DP, ZeRO-1: measured = theory exactly.
 2. ZeRO-2 extra (+0.242): one layer's full grad before its reduce-scatter (+0.25) + grad shards already reduced (+0.055) − shards not yet stored.
@@ -26,11 +28,12 @@ Notebook: [`zero_stages_32_virtual_gpus.ipynb`](zero_stages_32_virtual_gpus.ipyn
 
 Checks:
 1. ZeRO-1/2/3 final weights bit-identical to DP after 10 steps (`True` ×3) → sharding changes storage, not the math.
-2. Avg of 32 grads (4 samples each) vs one 128-sample grad: max diff 3.5e-10 → DP is a bigger batch, nothing else.
+2. Avg of 32 grads (4 samples each) vs one 128-sample grad: max diff 2.2e-8 → DP is a bigger batch, nothing else.
 
 Timing notes:
-1. DP fwd+bwd 0.678 s vs ~0.2–0.28 s for the rest, despite identical work → warm-up, DP runs first.
-2. Optimizer time per rank drops only ~3–4×, not 32×: shards are tiny, per-call overhead dominates. On a real model it approaches 32×.
+1. DP fwd+bwd 0.505 s vs ~0.23 s for the rest, despite identical work → warm-up (CUDA init, kernel caching), DP runs first.
+2. Optimizer time per rank is ~1–1.3 ms for every stage, not 32× lower under ZeRO. On a GPU each tiny Adam update pays a fixed kernel-launch cost regardless of size (full layer = 65K elements, shard = 2K). The 1/32 work saving only shows in time once tensors are large enough to be compute-bound — i.e. on a real model.
+3. Earlier CPU run showed a ~3–4× drop: CPU per-element cost is higher, so the size difference partly showed through the overhead.
 
 30B extrapolation (GiB per GPU, * = fits 74.5 GiB) — matches the lecture's memory ladder:
 
@@ -55,7 +58,7 @@ Timing notes:
 
 **ZeRO-3.** Shard the weights too. Each layer is all-gathered for forward, dropped, all-gathered again for backward, dropped. That extra gather = 3P. Measured peak is 0.992, not 0.5, because one gathered layer + its grad sit in memory briefly.
 
-**Compute.** Forward/backward work is identical in every stage. ZeRO removes the redundant optimizer step (each rank does 1/32 of it). The price is only communication, and only for stage 3.
+**Compute.** Forward/backward work is identical in every stage. ZeRO removes the redundant optimizer step (each rank does 1/32 of it) — a real saving at scale, hidden by launch overhead at toy size. The price is only communication, and only for stage 3.
 
 **Why the floor at 4 B.** DP and ZeRO-1 keep full weights + full grads on every card: 4 B × 30B = 111.8 GiB > 74.5 GiB, at any GPU count. So for V5: ZeRO-2 from 32 GPUs or ZeRO-3 from 8.
 
